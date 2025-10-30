@@ -1,0 +1,5 @@
+{
+  "tokenizer": "o200k_base",
+  "vocab_size": 200019,
+  "dataset": "fineweb-edu"
+}
