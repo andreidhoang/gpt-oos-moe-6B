@@ -1,9 +1,0 @@
-{
-  "permissions": {
-    "allow": [
-      "Read(//Users/danghuyhoang/Desktop/GPT-oss/**)"
-    ],
-    "deny": [],
-    "ask": []
-  }
-}
