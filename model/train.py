@@ -54,7 +54,7 @@ from model.model import (
     Transformer,
     ModelConfig,
     TransformerBlock,
-    gpt_oss_moe_8b_config,
+    gpt_oss_moe_6b_config,
 )
 
 # Import data loader
@@ -70,16 +70,18 @@ def get_args():
 
     # Data
     ap.add_argument("--data_dir", type=str, required=True, help="Directory with tokenized data")
-    ap.add_argument("--out_dir", type=str, default="out/8b_moe_run1", help="Output directory")
+    ap.add_argument("--out_dir", type=str, default="out/6b_moe_run1", help="Output directory")
 
     # Model
-    ap.add_argument("--model_config", type=str, default="8b", choices=["8b"], help="Model configuration")
+    ap.add_argument("--model_config", type=str, default="6b", choices=["6b"], help="Model configuration")
 
     # Training
-    ap.add_argument("--batch_size", type=int, default=4, help="Micro batch size per GPU")
-    ap.add_argument("--block_size", type=int, default=4096, help="Context length")
+    # SAFE DEFAULTS: batch_size=2, block_size=2048 (conservative to avoid OOM)
+    # For H100 100GB, you can gradually increase: batch_size=4-8, block_size=2048-4096
+    ap.add_argument("--batch_size", type=int, default=2, help="Micro batch size per GPU (safe default: 2, try 4-8 for H100 100GB)")
+    ap.add_argument("--block_size", type=int, default=2048, help="Context length (safe default: 2048, try 4096 if memory allows)")
     ap.add_argument("--max_iters", type=int, default=50000, help="Max training iterations")
-    ap.add_argument("--grad_accum_steps", type=int, default=32, help="Gradient accumulation steps")
+    ap.add_argument("--grad_accum_steps", type=int, default=32, help="Gradient accumulation steps (increase to maintain effective batch size)")
 
     # Optimization
     ap.add_argument("--lr", type=float, default=3e-4, help="Peak learning rate")
@@ -149,9 +151,24 @@ def get_args():
     # System
     ap.add_argument("--seed", type=int, default=1337, help="Random seed")
     ap.add_argument("--compile", action="store_true", default=False,
-                    help="Use torch.compile (experimental)")
+                    help="Use torch.compile for faster training (disabled by default for stability)")
+    ap.add_argument("--compile_mode", type=str, default="reduce-overhead", 
+                    choices=["default", "reduce-overhead", "max-autotune"],
+                    help="torch.compile mode (reduce-overhead recommended for training)")
     ap.add_argument("--local-rank", type=int, default=None,
                     help="Local rank (for torch.distributed.launch compatibility, ignored if using env vars)")
+    
+    # Performance optimization
+    ap.add_argument("--sync_every_n_steps", type=int, default=1,
+                    help="Sync gradients every N accumulation steps (1=always sync, >1=async)")
+    ap.add_argument("--fused_adam", action="store_true", default=False,
+                    help="Use fused AdamW optimizer (faster on H100, disabled by default)")
+    
+    # Memory optimization
+    ap.add_argument("--activation_checkpointing", action="store_true", default=False,
+                    help="Enable activation checkpointing to save memory (slower but uses less memory)")
+    ap.add_argument("--gradient_checkpointing", action="store_true", default=False,
+                    help="Enable gradient checkpointing (trade compute for memory)")
 
     return ap.parse_args()
 
@@ -323,16 +340,40 @@ def load_checkpoint(model, optimizer, args, rank):
 
     rank0_print(f"[train] Resuming from {ckpt_path}")
 
-    payload = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+    try:
+        payload = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+    except Exception as e:
+        rank0_print(f"[train] ERROR: Failed to load checkpoint {ckpt_path}: {e}")
+        rank0_print(f"[train] Starting from scratch...")
+        return 0, float("inf")
 
-    with FSDP.state_dict_type(model, StateDictType.SHARDED_STATE_DICT):
-        model.load_state_dict(payload["model_state_dict"])
+    # Validate checkpoint structure
+    if "model_state_dict" not in payload:
+        rank0_print(f"[train] ERROR: Invalid checkpoint format (missing model_state_dict)")
+        return 0, float("inf")
+    
+    if "optimizer_state_dict" not in payload:
+        rank0_print(f"[train] ERROR: Invalid checkpoint format (missing optimizer_state_dict)")
+        return 0, float("inf")
 
-    shard_optim = FSDP.optim_state_dict_to_load(payload["optimizer_state_dict"], model, optimizer)
-    optimizer.load_state_dict(shard_optim)
+    try:
+        with FSDP.state_dict_type(model, StateDictType.SHARDED_STATE_DICT):
+            model.load_state_dict(payload["model_state_dict"], strict=False)
+
+        shard_optim = FSDP.optim_state_dict_to_load(payload["optimizer_state_dict"], model, optimizer)
+        optimizer.load_state_dict(shard_optim)
+    except Exception as e:
+        rank0_print(f"[train] ERROR: Failed to load model/optimizer state: {e}")
+        rank0_print(f"[train] Starting from scratch...")
+        return 0, float("inf")
 
     iter_num = int(payload.get("iter_num", 0))
     best_val = float(payload.get("best_val_loss", float("inf")))
+
+    # Validate iter_num is reasonable
+    if iter_num < 0 or iter_num > args.max_iters:
+        rank0_print(f"[train] WARNING: Invalid iter_num {iter_num}, resetting to 0")
+        iter_num = 0
 
     if is_dist():
         dist.barrier()
@@ -355,16 +396,21 @@ def evaluate(model, val_loader, args, device, amp_dtype):
 
     ctx = nullcontext() if "cpu" in str(device) else torch.autocast("cuda", dtype=amp_dtype)
 
-    for _ in range(args.eval_iters):
-        x, y = val_loader.get_batch()
-        x, y = x.to(device, non_blocking=True), y.to(device, non_blocking=True)
-        with ctx:
-            _, out = model(x, labels=y)
-        loss_val = out["loss"].item()
-        if not math.isfinite(loss_val):
-            rank0_print(f"[eval] WARNING: Non-finite loss detected: {loss_val}")
-            loss_val = float("inf")
-        losses.append(loss_val)
+    for eval_step in range(args.eval_iters):
+        try:
+            x, y = val_loader.get_batch()
+            x, y = x.to(device, non_blocking=True), y.to(device, non_blocking=True)
+            with ctx:
+                _, out = model(x, labels=y)
+            loss_val = out["loss"].item()
+            if not math.isfinite(loss_val):
+                rank0_print(f"[eval] WARNING: Non-finite loss detected at eval_step {eval_step}: {loss_val}")
+                loss_val = float("inf")
+            losses.append(loss_val)
+        except Exception as e:
+            rank0_print(f"[eval] WARNING: Failed to evaluate batch {eval_step}: {e}")
+            losses.append(float("inf"))  # Use worst-case loss for failed batch
+            continue
         
         # Collect MoE metrics if available
         if "expert_utilization" in out:
@@ -449,8 +495,17 @@ def sample_text(model, enc, device, args, amp_dtype) -> str:
 # ------------------------------------------------------------------------------------
 
 def main():
-    # Set environment variable for better CUDA memory management
+    # Set environment variables for better CUDA memory management and performance
     os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+    
+    # H100-specific optimizations
+    os.environ.setdefault("NCCL_IB_DISABLE", "0")  # Enable InfiniBand if available
+    os.environ.setdefault("NCCL_DEBUG", "WARN")  # Reduce NCCL logging overhead
+    os.environ.setdefault("CUDA_LAUNCH_BLOCKING", "0")  # Enable async kernel launches
+    
+    # Enable TensorFloat-32 for faster training on H100 (default in PyTorch 1.12+)
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
 
     args = get_args()
     validate_args(args)  # Validate arguments before proceeding
@@ -553,13 +608,13 @@ def main():
     tok_name_ref[0] = tok_name  # Update for signal handler
 
     # Build model config
-    if args.model_config == "8b":
-        cfg = gpt_oss_moe_8b_config()
+    if args.model_config == "6b":
+        cfg = gpt_oss_moe_6b_config()
         cfg.vocab_size = vocab_size
 
         # Fix aux loss coefficient if using default
         if cfg.router_aux_loss_coef == 0.02:
-            rank0_print(f"[train] Adjusting router_aux_loss_coef from 0.02 to 0.005 for 8 experts")
+            rank0_print(f"[train] Adjusting router_aux_loss_coef from 0.02 to 0.005 for 6 experts")
             cfg.router_aux_loss_coef = 0.005
     else:
         raise ValueError(f"Unknown model config: {args.model_config}")
@@ -608,6 +663,11 @@ def main():
     # FSDP helps with optimizer state memory even for single GPU
     if is_dist():
         rank0_print("[train] Wrapping model with FSDP...")
+        
+        # For memory-constrained setups, consider CPU offloading optimizer states
+        # This is slower but uses less GPU memory
+        # Set offload_optimizer_state=True if you're hitting OOM
+        
         model = FSDP(
             base_model,
             auto_wrap_policy=auto_wrap_policy,
@@ -616,6 +676,8 @@ def main():
             use_orig_params=True,
             limit_all_gathers=True,
             param_init_fn=param_init_fn,
+            # CPU offloading can help with OOM but is slower
+            # offload_optimizer_state=False,  # Set True if OOM
         )
     else:
         # Single GPU: Use FSDP anyway to reduce optimizer memory
@@ -639,6 +701,35 @@ def main():
             param_init_fn=param_init_fn,
         )
     model_ref = model  # Update for signal handler
+
+    # Compile model for faster training (after FSDP wrapping)
+    # Note: torch.compile with FSDP requires special handling
+    if args.compile:
+        rank0_print(f"[train] Compiling model with mode={args.compile_mode}...")
+        try:
+            if hasattr(torch, "compile"):
+                # torch.compile with FSDP is experimental but can work
+                # It compiles the forward pass, which can provide 10-20% speedup
+                # However, it may cause issues with checkpointing or certain operations
+                try:
+                    # Compile the FSDP-wrapped model
+                    # PyTorch will compile the forward pass during first execution
+                    model = torch.compile(model, mode=args.compile_mode)
+                    rank0_print(f"[train] ✅ Model compiled successfully with mode={args.compile_mode}")
+                    rank0_print(f"[train]   First forward pass will be slower (compiling), subsequent passes will be faster")
+                except Exception as compile_error:
+                    rank0_print(f"[train] ⚠️  Failed to compile model: {compile_error}")
+                    rank0_print(f"[train]   torch.compile with FSDP may not be fully supported")
+                    rank0_print(f"[train]   Continuing without compilation...")
+                    args.compile = False
+            else:
+                rank0_print(f"[train] ⚠️  torch.compile not available (requires PyTorch 2.0+)")
+                rank0_print(f"[train]   Install PyTorch 2.0+ to enable compilation")
+                args.compile = False
+        except Exception as e:
+            rank0_print(f"[train] ⚠️  Failed to enable compilation: {e}")
+            rank0_print(f"[train]   Continuing without compilation...")
+            args.compile = False
 
     # Print shard size
     shard_params = sum(p.numel() for p in model.parameters())
@@ -694,12 +785,68 @@ def main():
     rank0_print("[train] Creating optimizer...")
     # Ensure we're accessing parameters correctly with FSDP
     # model.parameters() should return only sharded params
-    optimizer = torch.optim.AdamW(
-        model.parameters(),  # This should only see sharded params with FSDP
-        lr=args.lr,
-        betas=(args.beta1, args.beta2),
-        weight_decay=args.weight_decay,
-    )
+    
+    # Use fused AdamW if available (faster on H100)
+    if args.fused_adam and "cuda" in device:
+        try:
+            # Try to use fused optimizer from apex (if available)
+            try:
+                from apex.optimizers import FusedAdam
+                rank0_print("[train] Using FusedAdam from apex (faster)")
+                optimizer = FusedAdam(
+                    model.parameters(),
+                    lr=args.lr,
+                    betas=(args.beta1, args.beta2),
+                    weight_decay=args.weight_decay,
+                    adam_w_mode=True,
+                )
+            except ImportError:
+                # Fallback to torch.optim.AdamW with fused=True if available
+                if hasattr(torch.optim.AdamW, '__init__'):
+                    # Check if fused is supported (PyTorch 1.13+)
+                    try:
+                        optimizer = torch.optim.AdamW(
+                            model.parameters(),
+                            lr=args.lr,
+                            betas=(args.beta1, args.beta2),
+                            weight_decay=args.weight_decay,
+                            fused=True,  # Fused kernel (faster on H100)
+                        )
+                        rank0_print("[train] Using fused AdamW (PyTorch native)")
+                    except TypeError:
+                        # fused parameter not available, use regular AdamW
+                        optimizer = torch.optim.AdamW(
+                            model.parameters(),
+                            lr=args.lr,
+                            betas=(args.beta1, args.beta2),
+                            weight_decay=args.weight_decay,
+                        )
+                        rank0_print("[train] Using standard AdamW (fused not available)")
+                else:
+                    optimizer = torch.optim.AdamW(
+                        model.parameters(),
+                        lr=args.lr,
+                        betas=(args.beta1, args.beta2),
+                        weight_decay=args.weight_decay,
+                    )
+                    rank0_print("[train] Using standard AdamW")
+        except Exception as e:
+            rank0_print(f"[train] ⚠️  Failed to use fused optimizer: {e}")
+            rank0_print("[train]   Falling back to standard AdamW")
+            optimizer = torch.optim.AdamW(
+                model.parameters(),
+                lr=args.lr,
+                betas=(args.beta1, args.beta2),
+                weight_decay=args.weight_decay,
+            )
+    else:
+        optimizer = torch.optim.AdamW(
+            model.parameters(),
+            lr=args.lr,
+            betas=(args.beta1, args.beta2),
+            weight_decay=args.weight_decay,
+        )
+        rank0_print("[train] Using standard AdamW")
     optimizer_ref = optimizer  # Update for signal handler
     
     # Debug: Check parameter count per GPU (verify FSDP sharding works)
@@ -723,11 +870,23 @@ def main():
     iter_num, best_val_loss = load_checkpoint(model, optimizer, args, rank)
     iter_num_ref[0] = iter_num  # Update for signal handler
     best_val_loss_ref[0] = best_val_loss  # Update for signal handler
+    
+    # Ensure model is in training mode after checkpoint load
+    model.train()
 
     # Calculate total batch size
     total_batch_size = args.batch_size * args.block_size * args.grad_accum_steps * world_size
     rank0_print(f"[train] Total batch size: {total_batch_size:,} tokens")
     rank0_print(f"[train] Gradient accumulation steps: {args.grad_accum_steps}")
+    
+    # Memory estimate (rough)
+    # Activation memory scales roughly with: batch_size * block_size^2 * hidden_size * num_layers
+    # This is a conservative estimate - actual memory depends on FSDP sharding, attention type, etc.
+    # With FSDP, activations are local to each GPU
+    tokens_per_gpu = args.batch_size * args.block_size
+    rank0_print(f"[train] Tokens per GPU per forward: {tokens_per_gpu:,} ({args.batch_size} × {args.block_size})")
+    rank0_print(f"[train] ⚠️  Memory usage scales with batch_size × block_size^2")
+    rank0_print(f"[train]    Current: {args.batch_size} × {args.block_size}^2 = {args.batch_size * args.block_size * args.block_size:,} activation tokens")
     rank0_print("")
 
     # Training loop
@@ -740,23 +899,43 @@ def main():
         for param_group in optimizer.param_groups:
             param_group["lr"] = lr
 
+        # Set model to training mode (important for dropout, batch norm, etc.)
+        model.train()
+        
         # Zero gradients
         optimizer.zero_grad(set_to_none=True)
-        loss_accum = 0.0
+        # Initialize loss_accum as tensor for proper accumulation and all_reduce
+        loss_accum = torch.tensor(0.0, device=device, dtype=mp_dtype)
         router_loss_accum = 0.0
 
         # Gradient accumulation loop
         for micro_step in range(args.grad_accum_steps):
-            x, y = train_loader.get_batch()
+            # CRITICAL: FSDP optimization - only sync gradients on last micro-step
+            # This avoids unnecessary all-reduce operations during accumulation
+            if is_dist() and hasattr(model, "set_gradient_accumulation"):
+                # FSDP with use_orig_params=True: sync only on last step
+                model.set_gradient_accumulation(micro_step == args.grad_accum_steps - 1)
+            elif is_dist() and hasattr(model, "require_backward_grad_sync"):
+                # Older FSDP API compatibility
+                model.require_backward_grad_sync = (micro_step == args.grad_accum_steps - 1)
+            
+            # Get batch with error handling
+            try:
+                x, y = train_loader.get_batch()
+            except Exception as e:
+                rank0_print(f"[train] ERROR: Failed to load batch at iter {iter_num}, micro_step {micro_step}: {e}")
+                raise
+            
             x, y = x.to(device, non_blocking=True), y.to(device, non_blocking=True)
 
             with amp_ctx:
                 _, outputs = model(x, labels=y)
                 loss = outputs["loss"] / args.grad_accum_steps
 
-            loss_accum += loss.detach().item()
+            # Accumulate loss as tensor for proper all_reduce later
+            loss_accum += loss.detach()
             if "router_aux_loss" in outputs:
-                router_loss_accum += outputs["router_aux_loss"].item() / args.grad_accum_steps
+                router_loss_accum += outputs["router_aux_loss"].detach().item() / args.grad_accum_steps
 
             # Backward
             if scaler.is_enabled():
@@ -765,13 +944,19 @@ def main():
                 loss.backward()
 
         # Check for NaN/Inf loss before optimizer step
-        if not math.isfinite(loss_accum):
+        # Handle both tensor and scalar cases
+        if isinstance(loss_accum, torch.Tensor):
+            loss_accum_scalar = loss_accum.item()
+        else:
+            loss_accum_scalar = loss_accum
+            
+        if not math.isfinite(loss_accum_scalar):
             rank0_print(f"[train] ERROR: Non-finite loss detected at iter {iter_num}")
-            rank0_print(f"[train] Loss value: {loss_accum}")
+            rank0_print(f"[train] Loss value: {loss_accum_scalar}")
             rank0_print(f"[train] Router aux loss: {router_loss_accum}")
             # Save checkpoint for debugging
             save_checkpoint(model, optimizer, iter_num, best_val_loss, args, rank, world_size, tok_name)
-            raise ValueError(f"Training diverged: loss = {loss_accum}")
+            raise ValueError(f"Training diverged: loss = {loss_accum_scalar}")
 
         # Gradient clipping
         if args.grad_clip > 0:
@@ -795,14 +980,28 @@ def main():
         # Logging
         if iter_num % args.log_interval == 0:
             # Average loss across GPUs
-            loss_t = torch.tensor([loss_accum], device=device)
+            # Convert loss_accum to tensor if it's still a scalar
+            if isinstance(loss_accum, torch.Tensor):
+                loss_t = loss_accum.clone().detach()
+            else:
+                loss_t = torch.tensor([loss_accum], device=device)
+            
             if is_dist():
                 dist.all_reduce(loss_t, op=dist.ReduceOp.AVG)
+                # Note: all_reduce with AVG already divides by world_size, no need to divide again
 
             dt = time.time() - t0
             t0 = time.time()
 
             tokens_per_sec = total_batch_size / dt if dt > 0 else 0
+            samples_per_sec = args.batch_size * args.grad_accum_steps * world_size / dt if dt > 0 else 0
+
+            # GPU memory usage
+            gpu_memory_gb = 0.0
+            gpu_utilization = ""
+            if "cuda" in device:
+                gpu_memory_gb = torch.cuda.max_memory_allocated() / 1e9
+                torch.cuda.reset_peak_memory_stats()
 
             log_str = f"iter {iter_num:06d} | loss {loss_t.item():.4f} | lr {lr:.6e} | "
             log_str += f"norm {norm:.4f} | dt {dt*1000:.1f}ms | tok/s {tokens_per_sec:.0f}"
@@ -811,8 +1010,17 @@ def main():
                 log_str += f" | router_aux {router_loss_accum:.6f}"
                 if router_loss_accum > 0.01:
                     log_str += " ⚠️"
+            
+            if gpu_memory_gb > 0:
+                log_str += f" | mem {gpu_memory_gb:.1f}GB"
 
             rank0_print(log_str)
+            
+            # Performance warnings
+            if iter_num > args.log_interval and tokens_per_sec < 500000 and rank == 0:
+                rank0_print(f"[train] ⚠️  Low throughput detected: {tokens_per_sec:.0f} tok/s")
+                rank0_print(f"[train]   Expected: >1M tok/s on 5x H100 with FlashAttention")
+                rank0_print(f"[train]   Check: FlashAttention status, batch size, and GPU utilization")
 
             # Log to Weights & Biases
             if args.wandb and rank == 0:
@@ -882,7 +1090,7 @@ def main():
                 try:
                     import sys
                     sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
-                    from scripts.evaluate_hellaswag import evaluate_hellaswag_simple
+                    from evaluate_hellaswag import evaluate_hellaswag_simple
                     enc, _, _ = load_tokenizer(args.data_dir)
                     
                     # Get model without FSDP wrapper for evaluation
@@ -921,7 +1129,7 @@ def main():
                 try:
                     import sys
                     sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
-                    from scripts.evaluate_mmlu import evaluate_mmlu_simple
+                    from evaluate_mmlu import evaluate_mmlu_simple
                     enc, _, _ = load_tokenizer(args.data_dir)
                     
                     # Get model without FSDP wrapper for evaluation
@@ -955,10 +1163,13 @@ def main():
             if is_dist():
                 dist.barrier()  # Sync all ranks
 
-        # Sampling (all ranks must participate for FSDP)
+        # Sampling (all ranks must participate for FSDP to avoid deadlock)
         if args.sample_every > 0 and iter_num > 0 and iter_num % args.sample_every == 0:
             try:
+                # CRITICAL: All ranks must call sample_text to avoid FSDP deadlock
                 txt = sample_text(model, enc, device, args, mp_dtype)
+                
+                # Only rank 0 prints/logs
                 if rank == 0:
                     print("\n--- SAMPLE ---")
                     print(txt)
@@ -970,7 +1181,11 @@ def main():
                             "samples/generated_text": wandb.Html(f"<pre>{txt}</pre>"),
                         }, step=iter_num)
             except Exception as e:
-                rank0_print(f"[sample] Error: {e}")
+                rank0_print(f"[sample] Error during sampling: {e}")
+                # Continue training even if sampling fails
+                import traceback
+                if rank == 0:
+                    traceback.print_exc()
 
         # Save checkpoint
         if args.save_every > 0 and iter_num > 0 and iter_num % args.save_every == 0:

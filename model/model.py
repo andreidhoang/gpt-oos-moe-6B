@@ -871,7 +871,7 @@ class Transformer(nn.Module):
 # Quick param sanity check for the 20B config
 # ------------------------------------------------------------------------------------
 
-def gpt_oss_moe_8b_config() -> ModelConfig:
+def gpt_oss_moe_6b_config() -> ModelConfig:
     return ModelConfig(
         vocab_size=201_088,
         hidden_size=2880,
@@ -900,7 +900,7 @@ def gpt_oss_moe_8b_config() -> ModelConfig:
 
 
 if __name__ == "__main__":
-    cfg = gpt_oss_moe_8b_config()
+    cfg = gpt_oss_moe_6b_config()
     model = Transformer(cfg)
     n_params = sum(p.numel() for p in model.parameters())
     print(f"Total parameters: {n_params/1e9:.3f} B")

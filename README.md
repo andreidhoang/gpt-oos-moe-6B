@@ -1,4 +1,4 @@
-# GPT-OSS-8B MoE Training Guide
+# GPT-OSS-6B: Open-Source MoE Training Guide
 
 Production-ready FSDP training setup for 8B MoE model with proper aux loss handling.
 
@@ -11,6 +11,7 @@ python scripts/validate_setup.py --data_dir ../gpt-oss-pretrain/build-nanogpt/ed
 ```
 
 This checks:
+
 - ✅ Data format and tokenizer compatibility (o200k)
 - ✅ Model can build and run forward/backward
 - ✅ CUDA availability and memory
@@ -47,6 +48,7 @@ torchrun --standalone --nproc_per_node=8 train.py \
 ## Training Configuration
 
 ### Model Architecture
+
 - **Parameters**: ~8B total, ~2.2B active per token
 - **Experts**: 8 experts, top-2 routing
 - **Attention**: GQA (64 query heads, 8 KV heads)
@@ -76,28 +78,31 @@ dtype = "bfloat16"          # Mixed precision (bf16 recommended)
 
 ### Memory Requirements
 
-| GPUs | Batch Size | Block Size | Memory/GPU | Throughput |
-|------|------------|------------|------------|------------|
-| 1x A100 40GB | 2 | 2048 | ~35 GB | ~1K tok/s |
-| 1x A100 80GB | 4 | 4096 | ~70 GB | ~2K tok/s |
-| 8x A100 40GB | 4 | 4096 | ~32 GB | ~16K tok/s |
-| 8x A100 80GB | 8 | 4096 | ~60 GB | ~32K tok/s |
+| GPUs         | Batch Size | Block Size | Memory/GPU | Throughput |
+| ------------ | ---------- | ---------- | ---------- | ---------- |
+| 1x A100 40GB | 2          | 2048       | ~35 GB     | ~1K tok/s  |
+| 1x A100 80GB | 4          | 4096       | ~70 GB     | ~2K tok/s  |
+| 8x A100 40GB | 4          | 4096       | ~32 GB     | ~16K tok/s |
+| 8x A100 80GB | 8          | 4096       | ~60 GB     | ~32K tok/s |
 
 ---
 
 ## Command Line Arguments
 
 ### Data & Output
+
 - `--data_dir`: Directory with tokenized data (required)
 - `--out_dir`: Output directory for checkpoints (default: `out/8b_moe_run1`)
 
 ### Training
+
 - `--batch_size`: Micro batch size per GPU (default: 4)
 - `--block_size`: Context length (default: 4096)
 - `--max_iters`: Max training iterations (default: 50000)
 - `--grad_accum_steps`: Gradient accumulation (default: 32)
 
 ### Optimization
+
 - `--lr`: Peak learning rate (default: 3e-4)
 - `--min_lr`: Minimum learning rate (default: 3e-5)
 - `--weight_decay`: Weight decay (default: 0.1)
@@ -105,20 +110,24 @@ dtype = "bfloat16"          # Mixed precision (bf16 recommended)
 - `--warmup_iters`: Warmup steps (default: 2000)
 
 ### System
+
 - `--dtype`: Training dtype - `bfloat16`|`float16`|`float32` (default: bfloat16)
 - `--seed`: Random seed (default: 1337)
 
 ### Checkpointing
+
 - `--save_every`: Save checkpoint every N iters (default: 1000)
 - `--keep_last_n`: Keep only last N checkpoints (default: 5)
 
 ### Evaluation & Logging
+
 - `--eval_interval`: Evaluate every N iters (default: 500)
 - `--eval_iters`: Number of eval iterations (default: 100)
 - `--log_interval`: Log every N iters (default: 10)
 - `--log_router_stats`: Log router aux loss (default: true)
 
 ### Sampling
+
 - `--sample_every`: Sample text every N iters (default: 500)
 - `--sample_tokens`: Tokens to generate (default: 200)
 - `--temperature`: Sampling temperature (default: 0.8)
@@ -144,6 +153,7 @@ python fineweb_o200k.py  # Takes 2-4 hours for 10B tokens
 ### Option 2: Custom data
 
 Create data loader compatible format:
+
 - **Sharded .npy files**: `*_train_*.npy`, `*_val_*.npy`
 - **OR Memory-mapped .bin**: `train.bin`, `val.bin`
 - **Plus meta.json** with:
@@ -162,17 +172,20 @@ Create data loader compatible format:
 ### Key Metrics to Watch
 
 1. **Training Loss**: Should decrease smoothly
+
    - Initial: ~10-11 (random init)
    - After 1K iters: ~6-8
    - After 10K iters: ~4-6
    - Converged: ~2-3
 
 2. **Router Aux Loss**: Should be very small
+
    - ✅ Good: <0.001
    - ⚠️ Warning: 0.001-0.01
    - ❌ Bad: >0.01 (indicates router instability)
 
 3. **Gradient Norm**: Should be stable
+
    - ✅ Good: 0.5-1.5 (with grad_clip=1.0)
    - ⚠️ Warning: >2.0 frequently
    - ❌ Bad: NaN or Inf
@@ -194,17 +207,20 @@ Create data loader compatible format:
 ## Checkpointing
 
 ### Checkpoint Format
+
 - **Sharded**: `ckpt_rank00000.pt`, `ckpt_rank00001.pt`, ...
 - **Per-rank**: Each GPU saves its shard
 - **Resume**: Automatically resumes from latest checkpoint in out_dir
 
 ### Manual Resume
+
 ```bash
 # Training automatically resumes if checkpoint exists
 python train.py --data_dir ... --out_dir out/existing_run
 ```
 
 ### Checkpoint Contents
+
 - Model state dict (sharded)
 - Optimizer state dict (sharded)
 - Iteration number
@@ -218,6 +234,7 @@ python train.py --data_dir ... --out_dir out/existing_run
 ### OOM (Out of Memory)
 
 **Solutions**:
+
 1. Reduce `--batch_size` (4 → 2 → 1)
 2. Reduce `--block_size` (4096 → 2048 → 1024)
 3. Use `--dtype float16` instead of bfloat16 (saves memory)
@@ -226,6 +243,7 @@ python train.py --data_dir ... --out_dir out/existing_run
 ### Training Too Slow
 
 **Solutions**:
+
 1. Check GPU utilization: `nvidia-smi dmon`
 2. Move data to fast SSD (not HDD)
 3. Increase `--batch_size` if memory allows
@@ -234,6 +252,7 @@ python train.py --data_dir ... --out_dir out/existing_run
 ### Loss Not Decreasing
 
 **Checklist**:
+
 1. ✅ Data tokenized correctly (check with validate_setup.py)
 2. ✅ Learning rate appropriate (3e-4 is good start)
 3. ✅ Router aux loss not too high (should be <0.001)
@@ -250,11 +269,13 @@ python train.py --data_dir ... --out_dir out/existing_run
 ## Expected Training Time
 
 ### 10B Tokens (sample-10BT)
+
 - **1x A100**: ~48-72 hours
 - **8x A100**: ~6-10 hours
 - **Cost**: ~$50-150 (depending on cloud provider)
 
 ### 100B Tokens (sample-100BT)
+
 - **8x A100**: ~60-100 hours
 - **Cost**: ~$500-1500
 
@@ -338,10 +359,12 @@ If you use this training setup, please cite:
 ## Support
 
 For issues or questions:
+
 1. Check this README first
 2. Run `python scripts/validate_setup.py` to diagnose issues
 3. Review training logs in `out/*/logs.txt`
 4. Open GitHub issue with full error message and setup details
 
 Happy training! 🚀
+
 # gpt-oos-moe-6B

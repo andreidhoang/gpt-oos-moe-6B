@@ -10,6 +10,8 @@ Adapted for 8B MoE model with improvements:
 
 import glob
 import os
+import threading
+from queue import Queue
 from typing import Literal, Tuple
 
 import numpy as np
@@ -67,6 +69,11 @@ class DataLoaderLite:
         # Tracking
         self.shards_completed = 0
         self.tokens_processed = 0
+        
+        # Prefetch buffer for next shard (background loading)
+        self.prefetch_queue = Queue(maxsize=1)
+        self.prefetch_thread = None
+        self._prefetch_next_shard()
 
         if process_rank == 0:
             print(
@@ -81,6 +88,31 @@ class DataLoaderLite:
         self.current_position = self.B * self.T * self.process_rank
         if self.process_rank == 0:
             print(f"[DataLoader] Reset to shard 0")
+        self._prefetch_next_shard()
+    
+    def _prefetch_next_shard(self):
+        """Prefetch next shard in background thread"""
+        if self.prefetch_thread is not None and self.prefetch_thread.is_alive():
+            return  # Already prefetching
+        
+        def _load_next():
+            next_shard_idx = (self.current_shard + 1) % len(self.shards)
+            try:
+                next_tokens = load_tokens(self.shards[next_shard_idx])
+                self.prefetch_queue.put((next_shard_idx, next_tokens), block=False)
+            except:
+                pass  # Queue full or error, skip prefetch
+        
+        self.prefetch_thread = threading.Thread(target=_load_next, daemon=True)
+        self.prefetch_thread.start()
+    
+    def _get_prefetched_shard(self):
+        """Get prefetched shard if available"""
+        try:
+            next_shard_idx, next_tokens = self.prefetch_queue.get_nowait()
+            return next_shard_idx, next_tokens
+        except:
+            return None, None
 
     def next_batch(self):
         """Get next batch (original DataLoaderLite interface)"""
@@ -90,11 +122,21 @@ class DataLoaderLite:
         # Check if we got enough tokens
         if len(buf) < B*T + 1:
             # Not enough tokens, advance to next shard
-            old_shard = self.current_shard
-            self.current_shard = (self.current_shard + 1) % len(self.shards)
-            self.tokens = load_tokens(self.shards[self.current_shard])
+            # Try to use prefetched shard first
+            next_shard_idx, next_tokens = self._get_prefetched_shard()
+            if next_tokens is not None:
+                self.current_shard = next_shard_idx
+                self.tokens = next_tokens
+            else:
+                # Fallback to loading synchronously
+                self.current_shard = (self.current_shard + 1) % len(self.shards)
+                self.tokens = load_tokens(self.shards[self.current_shard])
+            
             self.current_position = B * T * self.process_rank
             self.shards_completed += 1
+            
+            # Prefetch next shard
+            self._prefetch_next_shard()
 
             # Log shard transitions
             if self.shards_completed % 10 == 0 and self.process_rank == 0:
@@ -115,11 +157,21 @@ class DataLoaderLite:
 
         # If loading the next batch would be out of bounds, advance to next shard
         if self.current_position + (B * T * self.num_processes + 1) > len(self.tokens):
-            old_shard = self.current_shard
-            self.current_shard = (self.current_shard + 1) % len(self.shards)
-            self.tokens = load_tokens(self.shards[self.current_shard])
+            # Try to use prefetched shard first
+            next_shard_idx, next_tokens = self._get_prefetched_shard()
+            if next_tokens is not None:
+                self.current_shard = next_shard_idx
+                self.tokens = next_tokens
+            else:
+                # Fallback to loading synchronously
+                self.current_shard = (self.current_shard + 1) % len(self.shards)
+                self.tokens = load_tokens(self.shards[self.current_shard])
+            
             self.current_position = B * T * self.process_rank
             self.shards_completed += 1
+            
+            # Prefetch next shard
+            self._prefetch_next_shard()
 
             # Log shard transitions
             if self.shards_completed % 10 == 0 and self.process_rank == 0:
